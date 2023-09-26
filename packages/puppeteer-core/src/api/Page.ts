@@ -40,11 +40,10 @@ import type {BidiNetworkManager} from '../bidi/NetworkManager.js';
 import type {Accessibility} from '../cdp/Accessibility.js';
 import type {Coverage} from '../cdp/Coverage.js';
 import type {DeviceRequestPrompt} from '../cdp/DeviceRequestPrompt.js';
-import {
-  NetworkManagerEvent,
-  type NetworkManager as CdpNetworkManager,
-  type Credentials,
-  type NetworkConditions,
+import type {
+  NetworkManager as CdpNetworkManager,
+  Credentials,
+  NetworkConditions,
 } from '../cdp/NetworkManager.js';
 import type {Tracing} from '../cdp/Tracing.js';
 import type {WebWorker} from '../cdp/WebWorker.js';
@@ -57,6 +56,10 @@ import {
   type EventType,
   type Handler,
 } from '../common/EventEmitter.js';
+import {
+  NetworkManagerEvent,
+  type NetworkManagerEvents,
+} from '../common/events.js';
 import type {FileChooser} from '../common/FileChooser.js';
 import {
   paperFormats,
@@ -64,6 +67,7 @@ import {
   type ParsedPDFOptions,
   type PDFOptions,
 } from '../common/PDFOptions.js';
+import {TimeoutSettings} from '../common/TimeoutSettings.js';
 import type {
   Awaitable,
   EvaluateFunc,
@@ -603,6 +607,10 @@ export abstract class Page extends EventEmitter<PageEvents> {
    * @internal
    */
   _isDragging = false;
+  /**
+   * @internal
+   */
+  _timeoutSettings = new TimeoutSettings();
 
   #requestHandlers = new WeakMap<Handler<HTTPRequest>, Handler<HTTPRequest>>();
 
@@ -1723,6 +1731,38 @@ export abstract class Page extends EventEmitter<PageEvents> {
       | ((res: HTTPResponse) => boolean | Promise<boolean>),
     options?: {timeout?: number}
   ): Promise<HTTPResponse>;
+
+  /**
+   * @internal
+   */
+  async _waitForHTTP<HTTP extends {url(): string} = HTTPRequest | HTTPResponse>(
+    networkManager: EventEmitter<NetworkManagerEvents>,
+    eventName: keyof NetworkManagerEvents,
+    urlOrPredicate: string | ((res: HTTP) => boolean | Promise<boolean>),
+    options: {timeout?: number} = {},
+    cancelation: Deferred<never>
+  ): Promise<HTTP> {
+    const {timeout: ms = this._timeoutSettings.timeout()} = options;
+    return await firstValueFrom(
+      (
+        fromEvent(
+          networkManager,
+          eventName as unknown as string
+        ) as Observable<HTTP>
+      ).pipe(
+        filterAsync(async http => {
+          if (isString(urlOrPredicate)) {
+            return urlOrPredicate === http.url();
+          }
+          if (typeof urlOrPredicate === 'function') {
+            return !!(await urlOrPredicate(http));
+          }
+          return false;
+        }),
+        raceWith(timeout(ms), from(cancelation.valueOrThrow()))
+      )
+    );
+  }
 
   /**
    * @param options - Optional waiting parameters

@@ -34,8 +34,6 @@ import {isErrorLike} from '../util/ErrorLike.js';
 
 import {debug} from './Debug.js';
 import {TimeoutError} from './Errors.js';
-import {EventSubscription} from './EventEmitter.js';
-import type {Awaitable} from './types.js';
 
 /**
  * @internal
@@ -325,39 +323,6 @@ export const isRegExp = (obj: unknown): obj is RegExp => {
 export const isDate = (obj: unknown): obj is Date => {
   return typeof obj === 'object' && obj?.constructor === Date;
 };
-
-/**
- * @internal
- */
-export async function waitForEvent<T>(
-  // eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
-  emitter: any,
-  eventName: string | symbol,
-  predicate: (event: T) => Awaitable<boolean>,
-  timeout: number,
-  abortPromise: Promise<Error> | Deferred<Error>
-): Promise<T> {
-  const deferred = Deferred.create<T>({
-    message: `Timeout exceeded while waiting for event ${String(eventName)}`,
-    timeout,
-  });
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  using _ = new EventSubscription(emitter, eventName, async (event: any) => {
-    if (await predicate(event)) {
-      deferred.resolve(event);
-    }
-  });
-
-  try {
-    const response = await Deferred.race<T | Error>([deferred, abortPromise]);
-    if (isErrorLike(response)) {
-      throw response;
-    }
-    return response;
-  } catch (error) {
-    throw error;
-  }
-}
 
 /**
  * @internal
