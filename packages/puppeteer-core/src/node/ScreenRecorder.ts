@@ -14,12 +14,10 @@
  * limitations under the License.
  */
 
-import type {ChildProcessWithoutNullStreams} from 'child_process';
-import {spawn, spawnSync} from 'child_process';
 import {PassThrough} from 'stream';
 
-import debug from 'debug';
 import type Protocol from 'devtools-protocol';
+import {bufferTime} from 'rxjs';
 
 import type {
   Observable,
@@ -27,9 +25,7 @@ import type {
 } from '../../third_party/rxjs/rxjs.js';
 import {
   bufferCount,
-  concatMap,
   filter,
-  from,
   fromEvent,
   lastValueFrom,
   map,
@@ -38,25 +34,38 @@ import {
 } from '../../third_party/rxjs/rxjs.js';
 import {CDPSessionEvent} from '../api/CDPSession.js';
 import type {BoundingBox} from '../api/ElementHandle.js';
+import type {JSHandle} from '../api/JSHandle.js';
 import type {Page} from '../api/Page.js';
 import {debugError} from '../common/util.js';
 import {guarded} from '../util/decorators.js';
 import {asyncDisposeSymbol} from '../util/disposable.js';
 
-const CRF_VALUE = 30;
-const DEFAULT_FPS = 30;
-
-const debugFfmpeg = debug('puppeteer:ffmpeg');
-
 /**
- * @internal
+ * @public
  */
 export interface ScreenRecorderOptions {
-  speed?: number;
+  /**
+   * Specifies the region of the viewport to crop.
+   */
   crop?: BoundingBox;
-  format?: 'gif' | 'webm';
+  /**
+   * Scales the output video.
+   *
+   * For example, `0.5` will shrink the width and height of the output video by
+   * half. `2` will double the width and height of the output video.
+   *
+   * @defaultValue `1`
+   */
   scale?: number;
-  path?: string;
+  /**
+   * Specifies the speed to record at.
+   *
+   * For example, `0.5` will slowdown the output video by 50%. `2` will double
+   * the speed of the output video.
+   *
+   * @defaultValue `1`
+   */
+  speed?: number;
 }
 
 /**
@@ -65,81 +74,81 @@ export interface ScreenRecorderOptions {
 export class ScreenRecorder extends PassThrough {
   #page: Page;
 
-  #process: ChildProcessWithoutNullStreams;
+  #recorder: Promise<
+    JSHandle<
+      readonly [
+        MediaRecorder,
+        CanvasCaptureMediaStreamTrack,
+        ScreenRecorderOptions,
+      ]
+    >
+  >;
 
   #controller = new AbortController();
-  #lastFrame: Promise<readonly [Buffer, number]>;
+  #lastFrame: Promise<readonly [string, number]>;
 
   /**
    * @internal
    */
   constructor(
-    page: Page,
+    renderer: Page,
+    target: Page,
     width: number,
     height: number,
-    {speed, scale, crop, format, path}: ScreenRecorderOptions = {}
+    options: ScreenRecorderOptions = {}
   ) {
-    super({allowHalfOpen: false});
+    super();
 
-    path ??= 'ffmpeg';
+    this.#page = target;
+    void this.#page.bringToFront();
 
-    // Tests if `ffmpeg` exists.
-    const {error} = spawnSync(path);
-    if (error) {
-      throw error;
-    }
-
-    this.#process = spawn(
-      path,
-      // See https://trac.ffmpeg.org/wiki/Encode/VP9 for more information on flags.
-      [
-        ['-loglevel', 'error'],
-        // Reduces general buffering.
-        ['-avioflags', 'direct'],
-        // Reduces initial buffering while analyzing input fps and other stats.
-        [
-          '-fpsprobesize',
-          `${0}`,
-          '-probesize',
-          `${32}`,
-          '-analyzeduration',
-          `${0}`,
-          '-fflags',
-          'nobuffer',
-        ],
-        // Forces input to be read from standard input, and forces png input
-        // image format.
-        ['-f', 'image2pipe', '-c:v', 'png', '-i', 'pipe:0'],
-        // Overwrite output and no audio.
-        ['-y', '-an'],
-        // This drastically reduces stalling when cpu is overbooked. By default
-        // VP9 tries to use all available threads?
-        ['-threads', '1'],
-        // Specifies the frame rate we are giving ffmpeg.
-        ['-framerate', `${DEFAULT_FPS}`],
-        // Specifies the encoding and format we are using.
-        this.#getFormatArgs(format ?? 'webm'),
-        // Disable bitrate.
-        ['-b:v', `${0}`],
-        // Filters to ensure the images are piped correctly.
-        [
-          '-vf',
-          `${
-            speed ? `setpts=${1 / speed}*PTS,` : ''
-          }crop='min(${width},iw):min(${height},ih):${0}:${0}',pad=${width}:${height}:${0}:${0}${
-            crop ? `,crop=${crop.width}:${crop.height}:${crop.x}:${crop.y}` : ''
-          }${scale ? `,scale=iw*${scale}:-1` : ''}`,
-        ],
-        'pipe:1',
-      ].flat(),
-      {stdio: ['pipe', 'pipe', 'pipe']}
-    );
-    this.#process.stdout.pipe(this);
-    this.#process.stderr.on('data', (data: Buffer) => {
-      debugFfmpeg(data.toString('utf8'));
+    void renderer.exposeFunction('sendChunk', (chunk: string) => {
+      this.write(chunk.slice(chunk.indexOf(',')), 'base64');
     });
+    this.#recorder = renderer.evaluateHandle(
+      async (width, height, options) => {
+        const canvas = document.body.appendChild(
+          document.createElement('canvas')
+        );
+        canvas.width = width;
+        canvas.height = height;
+        if (options.crop) {
+          canvas.width = options.crop.width;
+          canvas.height = options.crop.height;
+        }
+        if (options.scale) {
+          canvas.width *= options.scale;
+          canvas.height *= options.scale;
+        }
+        const stream = canvas.captureStream(0);
 
-    this.#page = page;
+        const track = stream.getTracks()[0] as CanvasCaptureMediaStreamTrack;
+
+        const reader = new FileReader();
+        const recorder = new MediaRecorder(stream, {
+          mimeType: 'video/webm;codecs=vp9',
+        });
+        recorder.addEventListener('dataavailable', async event => {
+          if (event.data.size === 0) {
+            return;
+          }
+          (window as any).sendChunk(
+            await new Promise((resolve, _) => {
+              reader.addEventListener('loadend', () => {
+                return resolve(reader.result);
+              });
+              reader.readAsDataURL(event.data);
+            })
+          );
+        });
+        recorder.start(500);
+        recorder.pause();
+        return [recorder, track, options] as const;
+      },
+      width,
+      height,
+      options
+    );
 
     const {client} = this.#page.mainFrame();
     client.once(CDPSessionEvent.Disconnected, () => {
@@ -163,69 +172,69 @@ export class ScreenRecorder extends PassThrough {
         }),
         map(event => {
           return {
-            buffer: Buffer.from(event.data, 'base64'),
+            frame: event.data,
             timestamp: event.metadata.timestamp!,
           };
         }),
         bufferCount(2, 1) as OperatorFunction<
-          {buffer: Buffer; timestamp: number},
+          {frame: string; timestamp: number},
           [
-            {buffer: Buffer; timestamp: number},
-            {buffer: Buffer; timestamp: number},
+            {frame: string; timestamp: number},
+            {frame: string; timestamp: number},
           ]
         >,
-        concatMap(([{timestamp: previousTimestamp, buffer}, {timestamp}]) => {
-          return from(
-            Array<Buffer>(
-              Math.round(DEFAULT_FPS * (timestamp - previousTimestamp))
-            ).fill(buffer)
-          );
+        map(([{timestamp: previousTimestamp, frame}, {timestamp}]) => {
+          return [frame, timestamp - previousTimestamp] as const;
         }),
-        map(buffer => {
-          void this.#writeFrame(buffer);
-          return [buffer, performance.now()] as const;
+        takeUntil(fromEvent(this.#controller.signal, 'abort')),
+        bufferTime(2000),
+        filter(frames => {
+          return frames.length > 0;
         }),
-        takeUntil(fromEvent(this.#controller.signal, 'abort'))
+        map(frames => {
+          void this.#writeFrames(frames);
+          return [frames.at(-1)![0], performance.now()] as const;
+        })
       ),
-      {defaultValue: [Buffer.from([]), performance.now()] as const}
+      {defaultValue: ['', performance.now()] as const}
     );
   }
 
-  #getFormatArgs(format: 'webm' | 'gif') {
-    switch (format) {
-      case 'webm':
-        return [
-          // Sets the codec to use.
-          ['-c:v', 'vp9'],
-          // Sets the format
-          ['-f', 'webm'],
-          // Sets the quality. Lower the better.
-          ['-crf', `${CRF_VALUE}`],
-          // Sets the quality and how efficient the compression will be.
-          ['-deadline', 'realtime', '-cpu-used', `${8}`],
-        ].flat();
-      case 'gif':
-        return [
-          // Sets the frame rate and uses a custom palette generated from the
-          // input.
-          [
-            '-vf',
-            'fps=5,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse',
-          ],
-          // Sets the format
-          ['-f', 'gif'],
-        ].flat();
-    }
-  }
-
   @guarded()
-  async #writeFrame(buffer: Buffer) {
-    const error = await new Promise<Error | null | undefined>(resolve => {
-      this.#process.stdin.write(buffer, resolve);
-    });
-    if (error) {
-      console.log(`ffmpeg failed to write: ${error.message}.`);
-    }
+  async #writeFrames(
+    frames: Array<readonly [frame: string, duration: number]>
+  ) {
+    await (
+      await this.#recorder
+    ).evaluate(async ([recorder, track, {crop, speed, scale = 1}], frames) => {
+      // Stop-motion recording! We resume the recorder for a calculated
+      // duration. Then we pause it since recording is real-time.
+      recorder.resume();
+      for (const [frame, duration] of frames) {
+        const response = await fetch(`data:image/png;base64,${frame}`);
+        const blob = await response.blob();
+
+        const {canvas} = track;
+        const bitmap = await window.createImageBitmap(
+          blob,
+          // The extra parameters will crop the image.
+          crop?.x ?? 0,
+          crop?.y ?? 0,
+          canvas.width / scale,
+          canvas.height / scale
+        );
+        const context = canvas.getContext('2d')!;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        // Scaling is done automatically here.
+        context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+        track.requestFrame();
+        await new Promise(resolve => {
+          setTimeout(resolve, duration * 1000 * (speed ?? 1));
+        });
+      }
+      recorder.pause();
+    }, frames);
   }
 
   /**
@@ -245,21 +254,17 @@ export class ScreenRecorder extends PassThrough {
 
     // Repeat the last frame for the remaining frames.
     const [buffer, timestamp] = await this.#lastFrame;
-    await Promise.all(
-      Array<Buffer>(
-        Math.max(
-          1,
-          Math.round((DEFAULT_FPS * (performance.now() - timestamp)) / 1000)
-        )
-      )
-        .fill(buffer)
-        .map(this.#writeFrame.bind(this))
-    );
+    await this.#writeFrames([[buffer, performance.now() - timestamp]]);
 
-    // Close stdin to notify FFmpeg we are done.
-    this.#process.stdin.end();
-    await new Promise(resolve => {
-      this.#process.once('close', resolve);
+    await (
+      await this.#recorder
+    ).evaluate(([recorder, track]) => {
+      const stopPromise = new Promise(resolve => {
+        recorder.addEventListener('stop', resolve, {once: true});
+      });
+      track.stop();
+      recorder.stop();
+      return stopPromise;
     });
   }
 

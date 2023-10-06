@@ -16,7 +16,6 @@
 export {
   bufferCount,
   catchError,
-  concatMap,
   defaultIfEmpty,
   defer,
   delay,
